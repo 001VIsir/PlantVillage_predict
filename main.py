@@ -58,7 +58,7 @@ IMG_HEIGHT = 256  # 图像高度
 IMG_WIDTH = 256   # 图像宽度
 BATCH_SIZE = 128   # 批处理大小
 EPOCHS = 15       # 训练轮次
-LEARNING_RATE = 0.01  # 初始学习率
+LEARNING_RATE = 0.001  # 降低初始学习率
 
 
 def load_and_preprocess_data():
@@ -80,13 +80,12 @@ def load_and_preprocess_data():
     print("正在加载和预处理数据...")
 
     # 数据增强与预处理 - 针对训练集
-    # 包括调整大小、随机旋转、翻转、颜色调整、标准化等操作
+    # 调整数据增强强度，避免过度正则化
     train_transform = transforms.Compose([
         transforms.Resize((IMG_HEIGHT, IMG_WIDTH)),  # 调整图像大小
-        transforms.RandomRotation(20),               # 随机旋转±20度
+        transforms.RandomRotation(10),               # 减少随机旋转角度
         transforms.RandomHorizontalFlip(),           # 随机水平翻转
-        transforms.RandomVerticalFlip(),             # 随机垂直翻转
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),  # 随机调整亮度、对比度和饱和度
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),  # 降低调整强度
         transforms.ToTensor(),                       # 将图像转换为张量
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])  # 使用ImageNet均值和标准差进行标准化
     ])
@@ -132,6 +131,10 @@ def load_and_preprocess_data():
 
     print(f"共有 {num_classes} 种植物病虫害类别")
 
+    # 打印样本数信息
+    print(f"训练集样本数: {len(train_dataset)}")
+    print(f"验证集样本数: {len(val_dataset)}")
+
     return train_loader, val_loader, num_classes, class_names
 
 
@@ -141,7 +144,7 @@ def build_model(num_classes):
 
     功能:
     1. 加载预训练的MobileNetV2模型
-    2. 冻结特征提取层
+    2. 部分解冻特征提取层
     3. 修改分类器以适应植物病虫害分类
 
     参数:
@@ -155,22 +158,36 @@ def build_model(num_classes):
     # 使用预训练的MobileNetV2 - 轻量级但高效的CNN架构
     model = models.mobilenet_v2(weights='IMAGENET1K_V1')  # 加载在ImageNet上预训练的权重
 
-    # 冻结预训练模型的参数 - 使用迁移学习，只训练新添加的分类器
+    # 解冻最后几层特征提取层 - 增加模型学习能力
+    # 冻结大部分层，但解冻最后几层
+    total_layers = len(list(model.features))
+    print(f"模型共有 {total_layers} 个特征层")
+
+    # 解冻最后10%的层
     for param in model.parameters():
         param.requires_grad = False
 
-    # 替换最后的分类器 - 自定义分类头以适应植物病虫害分类
+    # 解冻最后部分层
+    for i in range(int(total_layers * 0.9), total_layers):
+        for param in model.features[i].parameters():
+            param.requires_grad = True
+
+    # 替换分类器 - 使用更简单的结构
     in_features = model.classifier[1].in_features  # 获取特征维度
+
+    # 使用更简单的分类头
     model.classifier = nn.Sequential(
         nn.Dropout(0.2),                 # 添加dropout防止过拟合
-        nn.Linear(in_features, 512),     # 全连接层降维到512
-        nn.ReLU(),                       # ReLU激活函数
-        nn.Dropout(0.3),                 # 再次添加dropout进一步防止过拟合
-        nn.Linear(512, num_classes)      # 最终分类层，输出对应类别数量的logits
+        nn.Linear(in_features, num_classes)  # 直接连接到输出层
     )
 
     # 将模型移动到指定设备(GPU或CPU)
     model = model.to(device)
+
+    # 统计可训练参数
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型可训练参数: {trainable_params}/{total_params} ({trainable_params/total_params*100:.2f}%)")
 
     return model
 
@@ -201,12 +218,14 @@ def train_model(model, train_loader, val_loader, num_classes):
     # 定义损失函数和优化器
     criterion = nn.CrossEntropyLoss()  # 交叉熵损失函数，适用于多分类问题
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)  # AdamW优化器，结合Adam和权重衰减
-    # 学习率调度器 - 当验证损失不再下降时降低学习率
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.2, patience=3, min_lr=1e-6)
+
+    # 使用CosineAnnealingLR学习率调度器 - 更好的学习率衰减
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader)*EPOCHS, eta_min=1e-6)
 
     # 用于早停的变量 - 当验证损失不再下降时停止训练
     best_val_loss = float('inf')  # 初始最佳验证损失设为无穷大
-    patience = 5  # 如果验证损失连续5轮未改善，则停止训练
+    best_val_acc = 0.0
+    patience = 8  # 增加耐心值
     patience_counter = 0  # 记录验证损失未改善的轮数
     best_model_wts = None  # 存储最佳模型权重
 
@@ -265,6 +284,9 @@ def train_model(model, train_loader, val_loader, num_classes):
             loss.backward()
             optimizer.step()
 
+            # 更新学习率
+            scheduler.step()
+
             # 统计 - 计算批次损失和准确率
             _, preds = torch.max(outputs, 1)  # 获取每个样本的预测类别
             batch_loss = loss.item() * inputs.size(0)  # 计算批次总损失
@@ -276,16 +298,17 @@ def train_model(model, train_loader, val_loader, num_classes):
 
             # 更新进度条信息 - 显示当前批次损失、准确率和总体进度
             progress_bar.set_postfix({
-                'loss': f"{batch_loss / inputs.size(0):.4f}",
+                'loss': f"{loss.item():.4f}",
                 'acc': f"{batch_acc:.4f}",
-                '总进度': f"{steps_done}/{total_steps} ({steps_done / total_steps * 100:.1f}%)"
+                '总进度': f"{steps_done}/{total_steps} ({steps_done / total_steps * 100:.1f}%)",
+                'lr': f"{scheduler.get_last_lr()[0]:.6f}"  # 显示当前学习率
             })
 
             # 每10个batch输出一次详细信息到控制台和日志
             if batch_count % 10 == 0:
-                current_lr = optimizer.param_groups[0]['lr']  # 获取当前学习率
+                current_lr = scheduler.get_last_lr()[0]
                 log_msg = f"Epoch {epoch + 1}/{EPOCHS}, Batch {batch_count}/{len(train_loader)}, "
-                log_msg += f"Loss: {batch_loss / inputs.size(0):.4f}, Acc: {batch_acc:.4f}, LR: {current_lr:.6f}"
+                log_msg += f"Loss: {loss.item():.4f}, Acc: {batch_acc:.4f}, LR: {current_lr:.6f}"
 
                 # 将信息写入日志文件
                 with open(log_file, "a") as f:
@@ -304,8 +327,9 @@ def train_model(model, train_loader, val_loader, num_classes):
 
         # 验证阶段
         model.eval()  # 设置模型为评估模式（禁用dropout和使用batchnorm的评估模式）
-        running_loss = 0.0
-        running_corrects = 0
+        val_loss = 0.0
+        val_corrects = 0
+        total_samples = 0
 
         # 验证集进度条
         val_progress_bar = tqdm(val_loader, desc=f"验证 Epoch {epoch + 1}/{EPOCHS}",
@@ -316,6 +340,8 @@ def train_model(model, train_loader, val_loader, num_classes):
             for inputs, labels in val_progress_bar:
                 inputs = inputs.to(device)
                 labels = labels.to(device)
+                batch_size = inputs.size(0)
+                total_samples += batch_size
 
                 # 前向传播
                 outputs = model(inputs)
@@ -323,27 +349,26 @@ def train_model(model, train_loader, val_loader, num_classes):
 
                 # 计算准确率
                 _, preds = torch.max(outputs, 1)
-                batch_loss = loss.item() * inputs.size(0)
                 batch_corrects = torch.sum(preds == labels).item()
-                batch_acc = batch_corrects / inputs.size(0)
 
-                running_loss += batch_loss
-                running_corrects += batch_corrects
+                val_loss += loss.item() * batch_size
+                val_corrects += batch_corrects
+                batch_acc = batch_corrects / batch_size
 
                 # 更新验证进度条信息
                 val_progress_bar.set_postfix({
-                    'loss': f"{batch_loss / inputs.size(0):.4f}",
+                    'loss': f"{loss.item():.4f}",
                     'acc': f"{batch_acc:.4f}"
                 })
 
         # 计算整个验证集的损失和准确率
-        val_loss = running_loss / len(val_loader.dataset)
-        val_acc = running_corrects / len(val_loader.dataset)
+        val_loss /= total_samples
+        val_acc = val_corrects / total_samples
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
 
         # 获取当前学习率
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = scheduler.get_last_lr()[0]
 
         # 计算剩余时间估计
         time_elapsed = time.time() - start_time
@@ -373,12 +398,14 @@ def train_model(model, train_loader, val_loader, num_classes):
         with open(log_file, "a") as f:
             f.write(log_summary)
 
-        # 学习率调整 - 根据验证损失调整学习率
-        scheduler.step(val_loss)
-
         # 早停检查 - 如果验证损失改善，重置计数器并保存最佳模型
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # 同时检查验证准确率是否提高
+        if val_loss < best_val_loss or val_acc > best_val_acc:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+
             patience_counter = 0
             best_model_wts = model.state_dict().copy()  # 保存当前最佳模型权重
             # 保存最佳模型到文件
@@ -389,7 +416,7 @@ def train_model(model, train_loader, val_loader, num_classes):
 
         # 如果连续多轮验证损失未改善，提前停止训练
         if patience_counter >= patience:
-            print("早停: 验证损失连续多轮未改善")
+            print(f"早停: 验证损失连续{patience}轮未改善")
             break
 
         print()
@@ -407,7 +434,8 @@ def train_model(model, train_loader, val_loader, num_classes):
         f.write(f"\n训练完成! 总用时: {hours}小时 {minutes}分钟 {seconds}秒\n")
 
     # 加载最佳模型权重 - 确保返回的是最佳性能的模型
-    model.load_state_dict(best_model_wts)
+    if best_model_wts is not None:
+        model.load_state_dict(best_model_wts)
 
     return history, model
 
@@ -472,16 +500,19 @@ def evaluate_model(history, model, val_loader, class_names):
     model.eval()
     all_preds = []
     all_labels = []
+    all_probs = []
 
     # 收集所有预测结果和真实标签
     with torch.no_grad():
-        for inputs, labels in val_loader:
+        for inputs, labels in tqdm(val_loader, desc="评估模型", ncols=100, colour="magenta"):
             inputs = inputs.to(device)
             outputs = model(inputs)
+            probs = torch.nn.functional.softmax(outputs, dim=1)
             _, preds = torch.max(outputs, 1)
 
             all_preds.extend(preds.cpu().numpy())  # 将预测结果添加到列表
             all_labels.extend(labels.numpy())      # 将真实标签添加到列表
+            all_probs.extend(probs.cpu().numpy())  # 存储预测概率
 
     # 打印分类报告 - 包括精确率、召回率、F1分数等详细指标
     report = classification_report(all_labels, all_preds, target_names=class_names)
@@ -523,6 +554,8 @@ def evaluate_model(history, model, val_loader, class_names):
     plt.savefig(cm_path, bbox_inches='tight', dpi=300)
     plt.show()
     print(f"混淆矩阵已保存至: {cm_path}")
+
+    return all_probs, all_preds, all_labels
 
 
 def predict_image(model, image_path, class_names):
@@ -568,6 +601,12 @@ def predict_image(model, image_path, class_names):
     plt.tight_layout()
     plt.show()
 
+    # 打印top-3预测结果
+    top_probs, top_classes = torch.topk(probabilities, 3, dim=1)
+    print("\nTop-3预测结果:")
+    for i in range(3):
+        print(f"{class_names[top_classes[0][i].item()]}: {top_probs[0][i].item()*100:.2f}%")
+
     return class_names[predicted_class], confidence
 
 
@@ -602,6 +641,15 @@ def main():
     # 保存最终模型
     torch.save(trained_model.state_dict(), 'plant_disease_model_final.pth')
     print("模型已保存为 'plant_disease_model_final.pth'")
+
+    # 测试单张图像预测
+    test_image = "path/to/your/test/image.jpg"  # 替换为您的测试图像路径
+    if os.path.exists(test_image):
+        print("\n测试单张图像预测...")
+        predicted_class, confidence = predict_image(trained_model, test_image, class_names)
+        print(f"预测结果: {predicted_class} ({confidence}%)")
+    else:
+        print(f"测试图像不存在: {test_image}")
 
 
 if __name__ == "__main__":
