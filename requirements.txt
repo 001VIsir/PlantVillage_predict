@@ -1,0 +1,28 @@
+# 深度学习框架
+torch>=1.7.0
+torchvision>=0.8.0
+torchaudio>=0.7.0
+
+# 数据处理和可视化
+numpy>=1.19.0
+matplotlib>=3.3.0
+seaborn>=0.11.0
+Pillow>=8.0.0
+
+# 机器学习工具
+scikit-learn>=0.24.0
+
+# 进度条和用户界面
+tqdm>=4.60.0
+
+# 命令行参数解析
+argparse
+
+# 系统工具
+os-sys>=2.1.4
+
+# 日期时间处理
+datetime
+
+# 文件操作
+glob2>=0.7
